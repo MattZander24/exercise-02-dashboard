@@ -1,66 +1,69 @@
-from datetime import datetime, timezone
-from fastapi import Depends, FastAPI, HTTPException, Response
-from sqlalchemy import text
+from fastapi import FastAPI, Depends, HTTPException, Response, status
 from sqlalchemy.orm import Session
-from src.database import Base, engine, get_db
-from src.models import Node
-from src.schemas import NodeCreate, NodeResponse, NodeUpdate
+from sqlalchemy import text
+from datetime import datetime
+from contextlib import asynccontextmanager
 
-Base.metadata.create_all(bind=engine)
-app = FastAPI()
+from .database import engine, Base, get_db
+from . import models, schemas
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    Base.metadata.create_all(bind=engine)
+    yield
+
+app = FastAPI(lifespan=lifespan)
 
 @app.get("/health")
-def health(db: Session = Depends(get_db)):
+def health_check(db: Session = Depends(get_db)):
     try:
         db.execute(text("SELECT 1"))
-        db_status = "connected"
+        active_nodes_count = db.query(models.Node).filter(models.Node.status == "active").count()
+        return {"status": "ok", "db": "connected", "nodes_count": active_nodes_count}
     except Exception:
-        db_status = "disconnected"
-    count = db.query(Node).filter(Node.status == "active").count()
-    return {"status": "ok", "db": db_status, "nodes_count": count}
+        return {"status": "ok", "db": "error", "nodes_count": 0}
 
-@app.post("/api/nodes", response_model=NodeResponse, status_code=201)
-def register_node(node: NodeCreate, db: Session = Depends(get_db)):
-    existing = db.query(Node).filter(Node.name == node.name).first()
-    if existing:
+@app.post("/api/nodes", response_model=schemas.NodeResponse, status_code=status.HTTP_201_CREATED)
+def create_node(node: schemas.NodeCreate, db: Session = Depends(get_db)):
+    db_node = db.query(models.Node).filter(models.Node.name == node.name).first()
+    if db_node:
         raise HTTPException(status_code=409, detail="Node already exists")
-    db_node = Node(name=node.name, host=node.host, port=node.port)
-    db.add(db_node)
+    new_node = models.Node(name=node.name, host=node.host, port=node.port, status="active")
+    db.add(new_node)
+    db.commit()
+    db.refresh(new_node)
+    return new_node
+
+@app.get("/api/nodes", response_model=list[schemas.NodeResponse])
+def list_nodes(db: Session = Depends(get_db)):
+    return db.query(models.Node).all()
+
+@app.get("/api/nodes/{name}", response_model=schemas.NodeResponse)
+def get_node(name: str, db: Session = Depends(get_db)):
+    db_node = db.query(models.Node).filter(models.Node.name == name).first()
+    if not db_node:
+        raise HTTPException(status_code=404, detail="Node not found")
+    return db_node
+
+@app.put("/api/nodes/{name}", response_model=schemas.NodeResponse)
+def update_node(name: str, node_update: schemas.NodeUpdate, db: Session = Depends(get_db)):
+    db_node = db.query(models.Node).filter(models.Node.name == name).first()
+    if not db_node:
+        raise HTTPException(status_code=404, detail="Node not found")
+    update_data = node_update.model_dump(exclude_unset=True)
+    for key, value in update_data.items():
+        setattr(db_node, key, value)
+    db_node.updated_at = datetime.utcnow()
     db.commit()
     db.refresh(db_node)
     return db_node
 
-@app.get("/api/nodes", response_model=list[NodeResponse])
-def list_nodes(db: Session = Depends(get_db)):
-    return db.query(Node).all()
-
-@app.get("/api/nodes/{name}", response_model=NodeResponse)
-def get_node(name: str, db: Session = Depends(get_db)):
-    node = db.query(Node).filter(Node.name == name).first()
-    if not node:
-        raise HTTPException(status_code=404, detail="Node not found")
-    return node
-
-@app.put("/api/nodes/{name}", response_model=NodeResponse)
-def update_node(name: str, update: NodeUpdate, db: Session = Depends(get_db)):
-    node = db.query(Node).filter(Node.name == name).first()
-    if not node:
-        raise HTTPException(status_code=404, detail="Node not found")
-    if update.host is not None:
-        node.host = update.host
-    if update.port is not None:
-        node.port = update.port
-    node.updated_at = datetime.now(timezone.utc)
-    db.commit()
-    db.refresh(node)
-    return node
-
-@app.delete("/api/nodes/{name}", status_code=204)
+@app.delete("/api/nodes/{name}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_node(name: str, db: Session = Depends(get_db)):
-    node = db.query(Node).filter(Node.name == name).first()
-    if not node:
+    db_node = db.query(models.Node).filter(models.Node.name == name).first()
+    if not db_node:
         raise HTTPException(status_code=404, detail="Node not found")
-    node.status = "inactive"
-    node.updated_at = datetime.now(timezone.utc)
+    db_node.status = "inactive"
+    db_node.updated_at = datetime.utcnow()
     db.commit()
-    return Response(status_code=204)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
